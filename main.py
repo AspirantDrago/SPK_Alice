@@ -1,62 +1,87 @@
 """Alice webhook. Production entry point: wsgi:app."""
 
+import hashlib
 import logging
 
 from flask import Flask, jsonify, request
 
-from src.api import Lession, ScheduleGroup
 from src.config import Settings
-from src.utils import Api, ScheduleUnavailable
+from src.presentation import Answer, paginate, plain_answer, schedule_blocks
+from src.speech import group_to_speech, spoken_date, written_date
+from src.utils import Api, CacheExpired, GroupNeedsClarification, ScheduleOutdated, ScheduleUnavailable
+
+CONTINUE = {"дальше", "далее", "продолжи", "продолжение", "ещё", "еще"}
 
 
-def describe_lesson(lesson: Lession) -> str:
-    text = lesson.title
-    if lesson.cabinet:
-        text += " в кабинете " + lesson.cabinet
-    if lesson.korpus:
-        text += " в корпусе " + lesson.korpus
-    if lesson.teacher:
-        text += f". Ведёт {lesson.teacher.rstrip('.')}" + "."
-    return text
+def set_answer(res: dict, answer: Answer):
+    res["response"].update(text=answer.text, tts=answer.tts)
 
 
-def format_schedule(schedule: ScheduleGroup) -> str:
-    occupied = [i for i, pair in enumerate(schedule) if pair]
-    if not occupied:
-        return "Завтра отдыхаем"
-    first, last = occupied[0], occupied[-1]
-    answer = [f"Завтра у вас пар {len(occupied)}"]
-    if first:
-        answer.append(f"Учитесь с пары {first + 1}")
-    answer.append("")
-    for index in range(first, last + 1):
-        pair = schedule[index]
-        prefix = f"Пара {index + 1} - "
-        if not pair:
-            answer.append(prefix + "окно")
-        elif len(pair) == 1:
-            answer.append(prefix + describe_lesson(pair[0]))
-        else:
-            answer.append(prefix + "\n"+ "\n".join(
-                f"Подгруппа {i} - {describe_lesson(lesson)}" for i, lesson in enumerate(pair, 1)
-            ))
-    return "\n".join(answer)
+def continuation(req: dict):
+    state = req.get("state")
+    session = state.get("session") if isinstance(state, dict) else None
+    saved = session.get("schedule") if isinstance(session, dict) else None
+    if not isinstance(saved, dict):
+        return None
+    page = saved.get("next_page")
+    if (not isinstance(saved.get("group"), str) or len(saved["group"]) > 100
+            or not isinstance(saved.get("date"), str)
+            or not isinstance(saved.get("revision"), str)
+            or type(page) is not int or not 0 <= page < 10000):
+        return None
+    return saved
 
 
 def handle_dialog(req: dict, res: dict, api: Api):
     if req["session"]["new"]:
-        res["response"].update(text="Назовите вашу группу", buttons=[])
+        set_answer(res, plain_answer("Здравствуйте! Назовите вашу группу."))
+        res["response"]["buttons"] = []
         return
-    group = req["request"]["original_utterance"]
+    utterance = req["request"]["original_utterance"].strip()
+    saved = None
+    if utterance.casefold().rstrip(".!?") in CONTINUE:
+        saved = continuation(req)
+        if saved is None:
+            set_answer(res, plain_answer("Назовите группу, для которой нужно показать расписание."))
+            return
+        utterance = saved["group"]
     try:
-        schedule = api.get_by_group(group)
+        schedule = api.get_by_group(utterance)
+    except GroupNeedsClarification as exc:
+        choices = ", ".join(exc.candidates)
+        spoken = ", ".join(group_to_speech(name) for name in exc.candidates)
+        set_answer(res, Answer("Уточните группу. Вы имели в виду: " + choices + "?",
+                               "Уточните группу. Вы имели в виду: " + spoken + "?"))
+        res["response"]["buttons"] = [{"title": name, "hide": True} for name in exc.candidates]
+        return
+    except CacheExpired:
+        set_answer(res, plain_answer("Сохранённое расписание устарело, а новое пока не удалось загрузить. Попробуйте позже."))
+        return
+    except ScheduleOutdated as exc:
+        set_answer(res, Answer(
+            f"На сайте пока только расписание на {written_date(exc.schedule_date)}. Актуальное расписание ещё не опубликовано.",
+            f"На сайте пока только расписание на {spoken_date(exc.schedule_date)}. Актуальное расписание ещё не опубликовано.",
+        ))
+        return
     except ScheduleUnavailable:
-        res["response"]["text"] = "Расписание временно недоступно. Попробуйте немного позже."
+        set_answer(res, plain_answer("Расписание пока загружается или источник временно недоступен. Попробуйте немного позже."))
         return
     if schedule is None:
-        res["response"]["text"] = "Не удалось найти расписание. Повторите название вашей группы"
-    else:
-        res["response"]["text"] = format_schedule(schedule)
+        set_answer(res, plain_answer("Не удалось найти группу. Повторите её название, например по буквам и цифрам."))
+        return
+    pages = paginate(schedule_blocks(schedule))
+    revision = hashlib.sha256(repr(pages).encode()).hexdigest()[:16]
+    page = (saved["next_page"] if saved and saved["date"] == schedule.schedule_date.isoformat()
+            and saved["revision"] == revision else 0)
+    if page >= len(pages):
+        page = 0
+    set_answer(res, pages[page])
+    if page + 1 < len(pages):
+        res["session_state"] = {"schedule": {
+            "group": schedule.name, "date": schedule.schedule_date.isoformat(),
+            "revision": revision, "next_page": page + 1,
+        }}
+        res["response"]["buttons"] = [{"title": "Дальше", "hide": True}]
 
 
 def valid_payload(payload) -> bool:
@@ -81,8 +106,7 @@ def create_app(settings: Settings | None = None, api: Api | None = None) -> Flas
 
     @app.get("/health")
     def health():
-        # Liveness only: no network request and no guarantee that the source is up.
-        return jsonify(status="ok")
+        return jsonify(status="ok")  # Liveness only, no source request.
 
     @app.post("/post")
     def webhook():
@@ -90,9 +114,8 @@ def create_app(settings: Settings | None = None, api: Api | None = None) -> Flas
         if not valid_payload(payload):
             return jsonify(error="Invalid Alice request"), 400
         response = {
-            "session": payload["session"],
-            "version": payload["version"],
-            "response": {"end_session": False},
+            "session": payload["session"], "version": payload["version"],
+            "response": {"end_session": False}, "session_state": {},
         }
         handle_dialog(payload, response, app.extensions["schedule_api"])
         return jsonify(response)
@@ -102,4 +125,10 @@ def create_app(settings: Settings | None = None, api: Api | None = None) -> Flas
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    create_app().run()  # Local development only. Use Gunicorn for deployment.
+    app = create_app()
+    api = app.extensions["schedule_api"]
+    api.start_background_refresh()
+    try:
+        app.run(use_reloader=False)  # Production: Gunicorn starts the thread after fork.
+    finally:
+        api.stop_background_refresh()

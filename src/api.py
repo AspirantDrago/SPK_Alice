@@ -1,7 +1,9 @@
 """Download and parse the existing college schedule HTML format."""
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from itertools import islice
+import re
 
 from bs4 import BeautifulSoup
 import requests
@@ -19,16 +21,32 @@ type ScheduleGroup = list[None | list[Lession]]
 type Schedule = dict[str, ScheduleGroup]
 
 
+@dataclass(frozen=True)
+class ScheduleDocument:
+    schedule_date: date
+    groups: Schedule
+
+
 class ScheduleParseError(ValueError):
     """The source HTML is incomplete or its structure has changed."""
 
 
-def parse_schedule(html: bytes | str) -> Schedule:
+def parse_schedule(html: bytes | str) -> ScheduleDocument:
     soup = BeautifulSoup(html, "html.parser")
     container = soup.find("div", class_="lrg2")
     table = container.find("table") if container else None
     if table is None:
         raise ScheduleParseError("Schedule table div.lrg2 > table was not found")
+
+    dates = set()
+    for heading in container.select(".zg .zgr"):
+        for value in re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", heading.get_text(" ", strip=True)):
+            try:
+                dates.add(datetime.strptime(value, "%d.%m.%Y").date())
+            except ValueError as exc:
+                raise ScheduleParseError("Invalid schedule date") from exc
+    if len(dates) != 1:
+        raise ScheduleParseError("A unique schedule date was not found in the page heading")
 
     data: Schedule = {}
     rows_left = 0
@@ -95,10 +113,10 @@ def parse_schedule(html: bytes | str) -> Schedule:
 
     if rows_left or not data:
         raise ScheduleParseError("Empty or incomplete schedule table")
-    return data
+    return ScheduleDocument(dates.pop(), data)
 
 
-def get_schedule(url: str, *, session: requests.Session | None = None) -> Schedule:
+def get_schedule(url: str, *, session: requests.Session | None = None) -> ScheduleDocument:
     client = session if session is not None else requests
     # No automatic retries inside the webhook: keep upstream failures bounded.
     with client.get(url, timeout=(2, 5)) as response:
