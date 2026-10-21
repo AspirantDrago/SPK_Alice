@@ -1,0 +1,9 @@
+.git
+.venv
+.idea
+__pycache__
+*.py[cod]
+.env
+.env.*
+tests
+*.zip

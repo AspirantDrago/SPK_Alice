@@ -1,45 +1,61 @@
-import datetime
+"""Thread-safe, process-local schedule cache."""
 
-from src.api import Schedule, ScheduleGroup, get_schedule
+import logging
+from threading import Lock
+from time import monotonic
+
+import requests
+
+from src.api import ScheduleGroup, ScheduleParseError, get_schedule
+from src.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
-class MetaSingleton(type):
-    _instances = {}
-
-    def __call__(cls, *args, **kwargs):
-        if cls not in cls._instances:
-            cls._instances[cls] = super(MetaSingleton, cls).__call__(*args, **kwargs)
-        return cls._instances[cls]
+class ScheduleUnavailable(RuntimeError):
+    """No successfully downloaded schedule is available yet."""
 
 
-class Api(metaclass=MetaSingleton):
-    TIME_INTERVAL_MINUTES = 5
-
-    def __init__(self):
-        self._schedule: Schedule | None = None
-        self._last_update = datetime.datetime.now()
-
-    def _update(self):
-        self._last_update = datetime.datetime.now()
-        self._schedule = get_schedule()
+class Api:
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings if settings is not None else Settings.from_env()
+        self._interval_seconds = self.settings.time_interval_minutes * 60
+        self._schedule: dict[str, ScheduleGroup] | None = None
+        self._next_update = 0.0
+        self._lock = Lock()
+        # Access to this Session is serialized by _lock.
+        self._session = requests.Session()
 
     @staticmethod
     def normalize(title: str) -> str:
-        return ''.join(c for c in title.lower() if c.isalnum())
+        return "".join(c for c in title.casefold() if c.isalnum())
+
+    def _update(self):
+        try:
+            schedule = get_schedule(self.settings.url, session=self._session)
+            indexed = {}
+            for name, lessons in schedule.items():
+                key = self.normalize(name)
+                if not key or key in indexed:
+                    raise ScheduleParseError("Ambiguous or empty normalized group name")
+                indexed[key] = lessons
+            if not indexed:
+                raise ScheduleParseError("The schedule contains no groups")
+        except (requests.RequestException, ScheduleParseError):
+            logger.exception("Schedule refresh failed; retaining the last successful cache")
+            # Failed downloads must not cause a request storm or replace valid data.
+            self._next_update = monotonic() + min(30.0, self._interval_seconds)
+        else:
+            self._schedule = indexed
+            self._next_update = monotonic() + self._interval_seconds
+            logger.info("Schedule updated: %d groups", len(indexed))
 
     def get_by_group(self, group_name: str) -> ScheduleGroup | None:
-        current_time = datetime.datetime.now()
-        if (self._schedule is None or
-                current_time - self._last_update > datetime.timedelta(minutes=self.TIME_INTERVAL_MINUTES)):
-            self._update()
-        group_name_normalized = self.normalize(group_name)
-        if self._schedule:
-            for key in self._schedule.keys():
-                if group_name_normalized == self.normalize(key):
-                    return self._schedule[key]
-        return None
-
-
-if __name__ == '__main__':
-    api = Api()
-    print(api.get_by_group('ТМ2-4'))
+        with self._lock:
+            if monotonic() >= self._next_update:
+                self._update()
+            if self._schedule is None:
+                raise ScheduleUnavailable("Schedule source is currently unavailable")
+            schedule = self._schedule.get(self.normalize(group_name))
+            # Callers cannot mutate the cached lists; lessons themselves are frozen.
+            return None if schedule is None else [list(pair) if pair else None for pair in schedule]

@@ -1,72 +1,105 @@
-from flask import Flask, request
+"""Alice webhook. Production entry point: wsgi:app."""
 
 import logging
-import json
 
-from src.utils import Api
+from flask import Flask, jsonify, request
 
-app = Flask(__name__)
-api = Api()
-logging.basicConfig(level=logging.INFO)
-
-
-@app.route('/post', methods=['POST'])
-def main():
-    logging.info('Request: %r', request.json)
-    response = {
-        'session': request.json['session'],
-        'version': request.json['version'],
-        'response': {
-            'end_session': False
-        }
-    }
-    handle_dialog(request.json, response)
-    logging.info('Response: %r', request.json)
-    return json.dumps(response)
+from src.api import Lession, ScheduleGroup
+from src.config import Settings
+from src.utils import Api, ScheduleUnavailable
 
 
-def handle_dialog(req, res):
-    if req['session']['new']:
-        res['response']['text'] = 'Назовите вашу группу'
-        res['response']['buttons'] = []
-        return
-    group = req['request']['original_utterance']
-    schedule = api.get_by_group(group)
-    if not schedule:
-        res['response']['text'] = 'Не удалось найти расписание. Повторите название вашей группы'
-        return
-    if not any(schedule):
-        res['response']['text'] = 'Завтра отдыхаем'
-        return
-    while schedule and schedule[-1] is None:
-        schedule.pop()
-    answer: list[str] = []
-    answer.append('Завтра у вас пар {}'.format(
-        sum(map(bool, schedule))
-    ))
-    skip_lessions = 0
-    while schedule and schedule[0] is None:
-        schedule.pop(0)
-        skip_lessions += 1
-    if skip_lessions:
-        answer.append('Учитесь с пары {}'.format(skip_lessions))
-    answer.append('')
+def describe_lesson(lesson: Lession) -> str:
+    text = lesson.title
+    if lesson.cabinet:
+        text += " в кабинете " + lesson.cabinet
+    if lesson.korpus:
+        text += " в корпусе " + lesson.korpus
+    if lesson.teacher:
+        text += f". Ведёт {lesson.teacher.rstrip('.')}" + "."
+    return text
 
-    for n, pair in enumerate(schedule, 1):
-        s = f'Пара {n}'
-        if pair is None:
-            s += f' - окно'
+
+def format_schedule(schedule: ScheduleGroup) -> str:
+    occupied = [i for i, pair in enumerate(schedule) if pair]
+    if not occupied:
+        return "Завтра отдыхаем"
+    first, last = occupied[0], occupied[-1]
+    answer = [f"Завтра у вас пар {len(occupied)}"]
+    if first:
+        answer.append(f"Учитесь с пары {first + 1}")
+    answer.append("")
+    for index in range(first, last + 1):
+        pair = schedule[index]
+        prefix = f"Пара {index + 1} - "
+        if not pair:
+            answer.append(prefix + "окно")
         elif len(pair) == 1:
-            pair = pair[0]
-            s += f' - {pair.title}'
-            if pair.cabinet:
-                s += ' в кабинете ' + pair.cabinet
-            if pair.korpus:
-                s += ' в корпусе ' + pair.korpus
-            s += f'. Ведёт {pair.teacher}.'
-        answer.append(s)
+            answer.append(prefix + describe_lesson(pair[0]))
+        else:
+            answer.append(prefix + "\n"+ "\n".join(
+                f"Подгруппа {i} - {describe_lesson(lesson)}" for i, lesson in enumerate(pair, 1)
+            ))
+    return "\n".join(answer)
 
-    res['response']['text'] = '\n'.join(answer)
 
-if __name__ == '__main__':
-    app.run()
+def handle_dialog(req: dict, res: dict, api: Api):
+    if req["session"]["new"]:
+        res["response"].update(text="Назовите вашу группу", buttons=[])
+        return
+    group = req["request"]["original_utterance"]
+    try:
+        schedule = api.get_by_group(group)
+    except ScheduleUnavailable:
+        res["response"]["text"] = "Расписание временно недоступно. Попробуйте немного позже."
+        return
+    if schedule is None:
+        res["response"]["text"] = "Не удалось найти расписание. Повторите название вашей группы"
+    else:
+        res["response"]["text"] = format_schedule(schedule)
+
+
+def valid_payload(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    session = payload.get("session")
+    if not isinstance(session, dict) or not isinstance(session.get("new"), bool):
+        return False
+    if not isinstance(payload.get("version"), str):
+        return False
+    if session["new"]:
+        return True
+    utterance = payload.get("request")
+    return (isinstance(utterance, dict)
+            and isinstance(utterance.get("original_utterance"), str))
+
+
+def create_app(settings: Settings | None = None, api: Api | None = None) -> Flask:
+    app = Flask(__name__)
+    app.json.ensure_ascii = False
+    app.extensions["schedule_api"] = api if api is not None else Api(settings)
+
+    @app.get("/health")
+    def health():
+        # Liveness only: no network request and no guarantee that the source is up.
+        return jsonify(status="ok")
+
+    @app.post("/post")
+    def webhook():
+        payload = request.get_json(silent=True)
+        if not valid_payload(payload):
+            return jsonify(error="Invalid Alice request"), 400
+        response = {
+            "session": payload["session"],
+            "version": payload["version"],
+            "response": {"end_session": False},
+        }
+        handle_dialog(payload, response, app.extensions["schedule_api"])
+        return jsonify(response)
+
+    return app
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    create_app().run()  # Local development only. Use Gunicorn for deployment.

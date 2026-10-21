@@ -1,14 +1,13 @@
-from pprint import pprint
+"""Download and parse the existing college schedule HTML format."""
+
 from dataclasses import dataclass
 from itertools import islice
 
+from bs4 import BeautifulSoup
 import requests
-import bs4
-
-URL = 'https://schedule.str-spc.ru/hg.htm'
 
 
-@dataclass
+@dataclass(frozen=True)
 class Lession:
     title: str
     teacher: str
@@ -20,53 +19,88 @@ type ScheduleGroup = list[None | list[Lession]]
 type Schedule = dict[str, ScheduleGroup]
 
 
-def get_schedule() -> Schedule:
-    data = dict()
-    try:
-        r = requests.get(URL, timeout=1)
-        soup = bs4.BeautifulSoup(r.content, 'html.parser')
-        table = soup.find('div', class_='lrg2').table
-        count_lessons = 0
-        group_name = None
-        for row in islice(table.find_all('tr'), 1, None):
-            if row.find('td', class_='hd0'):
-                continue
-            # Если новая группа
-            if count_lessons == 0:
-                tds = row.find_all('td')
-                assert len(tds) >= 3
-                assert tds[0].find('a')
-                group_name = tds[0].find('a').text
-                count_lessons = int(tds[0].get('rowspan', 1))
-                data[group_name] = [None] * count_lessons
-
-            if count_lessons > 0:
-                count_lessons -= 1
-                if row.find('td', class_='nul'):
-                    continue
-                number_lesson = int(row.find_all('td', class_='hd')[-1].text)
-                sub_tds = row.find_all('td', class_='ur')
-                assert len(sub_tds)
-                sub_lessons = []
-                for td in sub_tds:
-                    lession = Lession(
-                        title=td.find('a', class_='z1').text,
-                        teacher=td.find('a', class_='z3').text,
-                    )
-                    if cab := td.find('a', class_='z2'):
-                        if '/' in cab.text:
-                            lession.cabinet = cab.text.split('/')[-1]
-                            lession.korpus = cab.text.split('/')[0]
-                        else:
-                            lession.cabinet = cab.text.split('/')
-
-                    sub_lessons.append(lession)
-                data[group_name][number_lesson - 1] = sub_lessons
-
-        return data
-    except requests.exceptions.RequestException:
-        return data
+class ScheduleParseError(ValueError):
+    """The source HTML is incomplete or its structure has changed."""
 
 
-if __name__ == '__main__':
-    pprint(get_schedule())
+def parse_schedule(html: bytes | str) -> Schedule:
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.find("div", class_="lrg2")
+    table = container.find("table") if container else None
+    if table is None:
+        raise ScheduleParseError("Schedule table div.lrg2 > table was not found")
+
+    data: Schedule = {}
+    rows_left = 0
+    group_name = None
+    seen_numbers = set()
+    for row in islice(table.find_all("tr"), 1, None):
+        if row.find("td", class_="hd0"):
+            if rows_left:
+                raise ScheduleParseError("Incomplete group before separator")
+            continue
+        tds = row.find_all("td", recursive=False)
+        if not tds:
+            continue
+        if rows_left == 0:
+            anchor = tds[0].find("a")
+            if len(tds) < 3 or anchor is None:
+                raise ScheduleParseError("Group header was not found")
+            group_name = anchor.get_text(" ", strip=True)
+            try:
+                rows_left = int(tds[0].get("rowspan", 1))
+            except (TypeError, ValueError) as exc:
+                raise ScheduleParseError("Invalid group rowspan") from exc
+            if not group_name or group_name in data or rows_left < 1:
+                raise ScheduleParseError("Invalid or duplicate group header")
+            data[group_name] = [None] * rows_left
+            seen_numbers = set()
+
+        rows_left -= 1
+        number_cells = row.find_all("td", class_="hd")
+        try:
+            number = int(number_cells[-1].get_text(strip=True))
+        except (IndexError, ValueError) as exc:
+            raise ScheduleParseError("Invalid lesson number") from exc
+        if number < 1 or number in seen_numbers:
+            raise ScheduleParseError("Invalid or duplicate lesson number")
+        seen_numbers.add(number)
+        # Rowspan counts rows, not necessarily the largest numbered lesson.
+        if number > len(data[group_name]):
+            data[group_name].extend([None] * (number - len(data[group_name])))
+
+        lessons = []
+        for td in row.find_all("td", class_="ur"):
+            title = td.find("a", class_="z1")
+            teacher = td.find("a", class_="z3")
+            if title is None or teacher is None or not title.get_text(strip=True):
+                raise ScheduleParseError("Lesson title or teacher was not found")
+            cabinet = korpus = None
+            location = td.find("a", class_="z2")
+            if location is not None:
+                text = location.get_text(" ", strip=True)
+                if "/" in text:
+                    korpus, cabinet = (part.strip() or None for part in text.rsplit("/", 1))
+                else:
+                    cabinet = text or None
+            lessons.append(Lession(
+                title=title.get_text(" ", strip=True),
+                teacher=teacher.get_text(" ", strip=True),
+                korpus=korpus,
+                cabinet=cabinet,
+            ))
+        if not lessons and not row.find("td", class_="nul"):
+            raise ScheduleParseError("Neither lessons nor an empty slot were found")
+        data[group_name][number - 1] = lessons or None
+
+    if rows_left or not data:
+        raise ScheduleParseError("Empty or incomplete schedule table")
+    return data
+
+
+def get_schedule(url: str, *, session: requests.Session | None = None) -> Schedule:
+    client = session if session is not None else requests
+    # No automatic retries inside the webhook: keep upstream failures bounded.
+    with client.get(url, timeout=(2, 5)) as response:
+        response.raise_for_status()
+        return parse_schedule(response.content)
