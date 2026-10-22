@@ -15,6 +15,9 @@ class Lession:
     teacher: str
     korpus: str | None = None
     cabinet: str | None = None
+    # None means the whole group; otherwise preserve the actual HTML columns.
+    subgroups: tuple[int, ...] | None = None
+    subgroup_count: int = 1
 
 
 type ScheduleGroup = list[None | list[Lession]]
@@ -88,7 +91,20 @@ def parse_schedule(html: bytes | str) -> ScheduleDocument:
             data[group_name].extend([None] * (number - len(data[group_name])))
 
         lessons = []
-        for td in row.find_all("td", class_="ur"):
+        cells = row.find_all("td", class_=["ur", "nul"], recursive=False)
+        try:
+            spans = [int(td.get("colspan", 1)) for td in cells]
+        except (TypeError, ValueError) as exc:
+            raise ScheduleParseError("Invalid lesson column span") from exc
+        if not cells or any(span < 1 for span in spans):
+            raise ScheduleParseError("Missing or invalid lesson columns")
+        column_count = sum(spans)
+        column = 1
+        for td, span in zip(cells, spans):
+            scope = None if span == column_count else tuple(range(column, column + span))
+            column += span
+            if "nul" in td.get("class", []):
+                continue
             title = td.find("a", class_="z1")
             teacher = td.find("a", class_="z3")
             if title is None or teacher is None or not title.get_text(strip=True):
@@ -106,6 +122,8 @@ def parse_schedule(html: bytes | str) -> ScheduleDocument:
                 teacher=teacher.get_text(" ", strip=True),
                 korpus=korpus,
                 cabinet=cabinet,
+                subgroups=scope,
+                subgroup_count=column_count,
             ))
         if not lessons and not row.find("td", class_="nul"):
             raise ScheduleParseError("Neither lessons nor an empty slot were found")

@@ -51,6 +51,24 @@ def describe_lesson(lesson: Lession) -> Answer:
     return Answer(" ".join(text), " ".join(speech))
 
 
+def subgroup_label(scope: tuple[int, ...]) -> Answer:
+    if len(scope) == 1:
+        number = scope[0]
+        return Answer(f"Подгруппа {number}", ordinal(number).capitalize() + " подгруппа")
+    return Answer("Подгруппы " + " и ".join(str(n) for n in scope),
+                  " и ".join(ordinal(n) for n in scope).capitalize() + " подгруппы")
+
+
+def subgroup_slots(schedule: GroupSchedule) -> dict[int, list[int]]:
+    lessons = [item for pair in schedule.lessons if pair for item in pair]
+    if not any(item.subgroups is not None for item in lessons):
+        return {}
+    count = max(item.subgroup_count for item in lessons)
+    return {n: [i + 1 for i, pair in enumerate(schedule.lessons)
+                if pair and any(item.subgroups is None or n in item.subgroups for item in pair)]
+            for n in range(1, count + 1)}
+
+
 def schedule_blocks(schedule: GroupSchedule, today: date | None = None) -> list[Answer]:
     label = day_label(schedule.schedule_date, today if today is not None else today_in_ufa())
     occupied = [i for i, pair in enumerate(schedule.lessons) if pair]
@@ -62,10 +80,25 @@ def schedule_blocks(schedule: GroupSchedule, today: date | None = None) -> list[
         return blocks
     count = len(occupied)
     word = noun(count, "пара", "пары", "пар")
-    blocks.append(Answer(f"{label.text} у вас {count} {word}.",
-                         f"{label.tts} у вас {cardinal(count, gender='f')} {word}."))
+    per_subgroup = subgroup_slots(schedule)
+    audience = "у группы" if per_subgroup else "у вас"
+    blocks.append(Answer(f"{label.text} {audience} {count} {word}.",
+                         f"{label.tts} {audience} {cardinal(count, gender='f')} {word}."))
+    for subgroup, slots in per_subgroup.items():
+        name = subgroup_label((subgroup,))
+        if not slots:
+            blocks.append(Answer(name.text + ": занятий нет.", name.tts + ": занятий нет."))
+            continue
+        amount = len(slots)
+        form = noun(amount, "пара", "пары", "пар")
+        start = slots[0]
+        preposition = "со" if start == 2 else "с"
+        blocks.append(Answer(
+            f"{name.text}: {amount} {form}, начало {preposition} {start}-й пары.",
+            f"{name.tts}: {cardinal(amount, gender='f')} {form}, начало {preposition} {ordinal(start, case='g')} пары.",
+        ))
     first, last = occupied[0], occupied[-1]
-    if first:
+    if first and not per_subgroup:
         number = first + 1
         preposition = "со" if number == 2 else "с"
         blocks.append(Answer(f"Занятия начинаются {preposition} {number}-й пары.",
@@ -77,16 +110,28 @@ def schedule_blocks(schedule: GroupSchedule, today: date | None = None) -> list[
         spoken = ordinal(number).capitalize() + " пара"
         if not pair:
             blocks.append(Answer(written + " — окно.", spoken + " — окно."))
-        elif len(pair) == 1:
+        elif len(pair) == 1 and pair[0].subgroups is None:
             lesson = describe_lesson(pair[0])
             blocks.append(Answer(written + ". " + lesson.text, spoken + ". " + lesson.tts))
         else:
-            # Preserve the repository's separate numbered subgroup lines.
+            # Use actual column numbers, including a single occupied half-row.
             blocks.append(Answer(written + ":", spoken + "."))
-            for n, item in enumerate(pair, 1):
-                lesson = describe_lesson(item)
-                blocks.append(Answer(f"Подгруппа {n}: {lesson.text}",
-                                     f"{ordinal(n).capitalize()} подгруппа. {lesson.tts}"))
+            emitted = set()
+            for n in range(1, max(item.subgroup_count for item in pair) + 1):
+                matching = [item for item in pair if item.subgroups is None or n in item.subgroups]
+                if not matching:
+                    name = subgroup_label((n,))
+                    blocks.append(Answer(name.text + ": занятий нет.", name.tts + ": занятий нет."))
+                for item in matching:
+                    if id(item) in emitted:
+                        continue
+                    emitted.add(id(item))
+                    lesson = describe_lesson(item)
+                    if item.subgroups:
+                        name = subgroup_label(item.subgroups)
+                        blocks.append(Answer(name.text + ": " + lesson.text, name.tts + ". " + lesson.tts))
+                    else:
+                        blocks.append(lesson)
     return blocks
 
 

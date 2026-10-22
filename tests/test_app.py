@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 from datetime import date, datetime
 import os
 from pathlib import Path
+import re
 from threading import Event
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -13,13 +14,14 @@ from main import create_app
 from src.api import Lession, ScheduleDocument, ScheduleParseError, get_schedule, parse_schedule
 from src.clock import UFA_TIMEZONE, today_in_ufa
 from src.config import DEFAULT_URL, Settings
-from src.presentation import Answer, describe_lesson, paginate, schedule_blocks
+from src.presentation import Answer, describe_lesson, paginate, schedule_blocks, subgroup_slots
 from src.recognition import GroupResolver, normalize
 from src.speech import cardinal, group_to_speech, noun, numbers_to_words, ordinal, spoken_date
 from src.utils import (Api, CacheExpired, GroupNeedsClarification, GroupSchedule,
                        ScheduleOutdated, ScheduleUnavailable)
 
 HTML = (Path(__file__).parent / "fixtures/schedule.html").read_bytes()
+SPLIT_HTML = (Path(__file__).parent / "fixtures/right_subgroup_only.html").read_bytes()
 DAY = date(2026, 10, 22)
 
 
@@ -220,10 +222,10 @@ class SpeechTests(unittest.TestCase):
         blocks = schedule_blocks(group(), today=DAY)
         text = "\n\n".join(block.text for block in blocks)
         speech = " ".join(block.tts for block in blocks)
-        self.assertIn("Сегодня у вас 2 пары.", text)
-        self.assertIn("Сегодня у вас две пары.", speech)
-        self.assertIn("со 2-й пары", text)
-        self.assertIn("со второй пары", speech)
+        self.assertIn("Сегодня у группы 2 пары.", text)
+        self.assertIn("Сегодня у группы две пары.", speech)
+        self.assertIn("начало со 2-й пары", text)
+        self.assertIn("начало со второй пары", speech)
         self.assertIn("3-я пара — окно", text)
         self.assertIn("Подгруппа 1:", text)
         self.assertIn("Подгруппа 2:", text)
@@ -495,6 +497,81 @@ class WebhookTests(unittest.TestCase):
         repeated = self.post(text="дальше", state=saved).json["response"]["text"]
         self.assertIn("Новый предмет", repeated)
         self.assertTrue(repeated.startswith("Сегодня"))
+
+
+class PartialSubgroupRegressionTests(unittest.TestCase):
+    def schedule(self, html=SPLIT_HTML):
+        document = parse_schedule(html)
+        return GroupSchedule("Л2-1", document.schedule_date, document.groups["Л2-1"])
+
+    def test_right_half_only_keeps_its_second_subgroup_number(self):
+        schedule = self.schedule()
+        for index in (1, 4):
+            self.assertEqual(len(schedule.lessons[index]), 1)
+            self.assertEqual(schedule.lessons[index][0].subgroups, (2,))
+            self.assertEqual(schedule.lessons[index][0].subgroup_count, 2)
+
+    def test_colspan_means_common_lesson_not_two_separate_lessons(self):
+        schedule = self.schedule()
+        for index in (2, 3):
+            self.assertEqual(len(schedule.lessons[index]), 1)
+            self.assertIsNone(schedule.lessons[index][0].subgroups)
+        self.assertEqual(subgroup_slots(schedule), {1: [3, 4], 2: [2, 3, 4, 5]})
+
+    def test_individual_counts_and_start_times_match_the_screenshot(self):
+        blocks = schedule_blocks(self.schedule(), today=DAY)
+        text = "\n\n".join(block.text for block in blocks)
+        speech = " ".join(block.tts for block in blocks)
+        self.assertIn("Подгруппа 1: 2 пары, начало с 3-й пары.", text)
+        self.assertIn("Подгруппа 2: 4 пары, начало со 2-й пары.", text)
+        self.assertIn("Первая подгруппа: две пары, начало с третьей пары.", speech)
+        self.assertIn("Вторая подгруппа: четыре пары, начало со второй пары.", speech)
+        self.assertNotIn("Занятия начинаются со 2-й пары", text)
+        self.assertNotRegex(speech, r"\d")
+
+    def test_single_subgroup_lessons_are_not_announced_as_common(self):
+        text = "\n\n".join(block.text for block in schedule_blocks(self.schedule(), today=DAY))
+        second = text.split("2-я пара:", 1)[1].split("3-я пара", 1)[0]
+        fifth = text.split("5-я пара:", 1)[1]
+        self.assertIn("Подгруппа 1: занятий нет.", second)
+        self.assertIn("Подгруппа 2: Иностранный язык.", second)
+        self.assertIn("Подгруппа 2: Башкирский язык.", fifth)
+        self.assertIn("3-я пара. Литература.", text)
+        self.assertIn("4-я пара. Физика.", text)
+        self.assertNotIn("вся группа", text.casefold())
+        speech = " ".join(block.tts for block in schedule_blocks(self.schedule(), today=DAY))
+        self.assertNotIn("вся группа", speech.casefold())
+
+    def test_left_half_only_is_not_relabelled_as_second_subgroup(self):
+        html = re.sub(r'(<td class="nul"></td>)(<td class="ur">.*?</td>)',
+                      r'\2\1', SPLIT_HTML.decode(), flags=re.S)
+        schedule = self.schedule(html)
+        self.assertEqual(schedule.lessons[1][0].subgroups, (1,))
+        self.assertEqual(subgroup_slots(schedule), {1: [2, 3, 4, 5], 2: [3, 4]})
+
+    def test_a_subgroup_with_no_lessons_is_reported_as_empty(self):
+        schedule = group([[Lession("Информатика", "", subgroups=(2,), subgroup_count=2)]])
+        text = "\n".join(block.text for block in schedule_blocks(schedule, today=DAY))
+        self.assertIn("Подгруппа 1: занятий нет.", text)
+        self.assertIn("Подгруппа 2: 1 пара, начало с 1-й пары.", text)
+
+    def test_invalid_colspan_is_rejected(self):
+        for value in (b'0', b'-1', b'invalid'):
+            with self.subTest(value=value), self.assertRaises(ScheduleParseError):
+                parse_schedule(SPLIT_HTML.replace(b'colspan="2"', b'colspan="' + value + b'"'))
+
+    def test_subgroup_information_survives_api_and_webhook(self):
+        api = Api(Settings())
+        self.addCleanup(api.stop_background_refresh)
+        with patch("src.utils.get_schedule", return_value=parse_schedule(SPLIT_HTML)), \
+                patch("src.utils.today_in_ufa", return_value=DAY), \
+                patch("src.presentation.today_in_ufa", return_value=DAY):
+            api.refresh_once()
+            response = create_app(api=api).test_client().post("/post", json=payload(text="Л2-1")).json["response"]
+        self.assertIn("Подгруппа 1: 2 пары", response["text"])
+        self.assertIn("Подгруппа 2: 4 пары", response["text"])
+        self.assertIn("Подгруппа 2: Башкирский язык", response["text"])
+        self.assertNotRegex(response["tts"], r"\d")
 
 
 if __name__ == "__main__":

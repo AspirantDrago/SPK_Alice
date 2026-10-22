@@ -64,8 +64,10 @@ class WsgiTests(unittest.TestCase):
             port = probe.getsockname()[1]
         cls.base = f"http://127.0.0.1:{port}"
         env = dict(os.environ, URL=f"http://127.0.0.1:{cls.source.server_port}/custom.htm",
-                   TIME_INTERVAL_MINUTES="0.002", MAX_CACHE_AGE_HOURS="0.0005")
+                   TIME_INTERVAL_MINUTES="0.002", MAX_CACHE_AGE_HOURS="0.0005",
+                   HOME="/proc/spk-alice-unwritable-home")
         env.pop("GUNICORN_CMD_ARGS", None)
+        env.pop("XDG_RUNTIME_DIR", None)
         cls.process = subprocess.Popen(
             [sys.executable, "-m", "gunicorn", "--config", "gunicorn.conf.py",
              "--bind", f"127.0.0.1:{port}", "wsgi:app"],
@@ -98,6 +100,8 @@ class WsgiTests(unittest.TestCase):
             raise AssertionError("Gunicorn failed to stop: " + output[-2000:])
         if "Exception in worker process" in output:
             raise AssertionError(output[-3000:])
+        if "Control server error" in output or "Failed to start control socket" in output:
+            raise AssertionError("Gunicorn tried to create a control socket: " + output[-3000:])
 
     def post(self, text="ТМ2-4", new=False):
         body = {"version": "1.0", "session": {"new": new},
@@ -117,7 +121,7 @@ class WsgiTests(unittest.TestCase):
         # Warm-up completion may follow the source's arrival counter by a few milliseconds.
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if "Сегодня у вас" in self.post()["response"]["text"]:
+            if "Сегодня у группы" in self.post()["response"]["text"]:
                 break
             time.sleep(0.02)
         else:
@@ -138,7 +142,7 @@ class WsgiTests(unittest.TestCase):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 answer = executor.submit(self.post).result(timeout=1)
-                self.assertIn("Сегодня у вас", answer["response"]["text"])
+                self.assertIn("Сегодня у группы", answer["response"]["text"])
         finally:
             with self.lock:
                 type(self).mode = "error"
@@ -162,7 +166,7 @@ class WsgiTests(unittest.TestCase):
             type(self).mode = "ok"
         before = self.downloads
         self.wait_for(lambda: self.downloads >= before + 2, 3)
-        self.assertIn("Сегодня у вас", self.post()["response"]["text"])
+        self.assertIn("Сегодня у группы", self.post()["response"]["text"])
 
 
 if __name__ == "__main__":

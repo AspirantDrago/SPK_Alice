@@ -10,6 +10,8 @@ accesslog = "-"
 errorlog = "-"
 capture_output = True
 preload_app = False
+# Runtime administration via gunicornc is unused. Avoid creating ~/.gunicorn
+# for the container's non-root user, whose home directory does not exist.
 control_socket_disable = True
 
 
